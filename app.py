@@ -223,7 +223,7 @@ def transform_pdf(input_path: str, output_path: str, direction: str = 'm_to_f') 
             # Expand the redaction rectangle more generously to ensure full coverage
             # Expand vertically based on font size, horizontally with fixed padding
             v_padding = mod["size"] * 0.15  # 15% of font size
-            h_padding = 2.5
+            h_padding = 3.8
             redact_rect = fitz.Rect(
                 bbox.x0 - h_padding,
                 bbox.y0 - v_padding,
