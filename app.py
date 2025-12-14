@@ -263,27 +263,20 @@ def transform_pdf(input_path: str, output_path: str, direction: str = 'm_to_f') 
             origin_pt = fitz.Point(mod["origin"])
 
             try:
-                # morph=(origin, matrix) scales the text horizontally
-                page.insert_text(
-                    origin_pt, 
-                    mod["transformed"], 
-                    fontname=fontname, 
-                    fontsize=mod["size"], 
-                    color=(r, g, b),
-                    morph=(origin_pt, fitz.Matrix(scale_x, 1))
-                )
-            except Exception as e:
-                print(f"Error inserting text '{mod['transformed']}': {e}")
-                # Fallback without morph if it fails
-                try:
-                    page.insert_text(
-                        origin_pt, 
-                        mod["transformed"], 
-                        fontsize=mod["size"],
-                        color=(r, g, b)
-                    )
-                except:
-                    pass
+                page.insert_text(
+                    mod["origin"], mod["transformed"],
+                    fontname=fontname, fontsize=mod["size"], color=(r, g, b)
+                )
+            except:
+                # First fallback (remove fontname)
+                try:
+                    page.insert_text(mod["origin"], mod["transformed"], fontsize=mod["size"])
+                except:
+                    # Final fallback (use an absolutely safe font)
+                    try:
+                        page.insert_text(mod["origin"], mod["transformed"], fontname="cour", fontsize=mod["size"])
+                    except:
+                        pass
 
         stats["pages_processed"] += 1
         stats["spans_modified"] += len(modifications)
