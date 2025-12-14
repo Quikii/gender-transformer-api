@@ -225,12 +225,254 @@ def transform_pdf(input_path: str, output_path: str, direction: str = 'm_to_f') 
 # =============================================================================
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+
+# Enable CORS for all routes with explicit settings
+CORS(app, resources={
+    r"/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization", "X-Requested-With"]
+    }
+})
+
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max
 
 
 @app.route('/')
 def index():
+    return '''<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gender Text Transformer</title>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; }
+    body {
+      font-family: sans-serif;
+      background-color: #2c2c2c;
+      background-image: linear-gradient(135deg, #1a1a1a 0%, #2c2c2c 50%, #1a1a1a 100%);
+      min-height: 100vh;
+    }
+    .tool-container { max-width: 700px; margin: 40px auto; padding: 30px; }
+    .tool-section {
+      background-color: rgba(255, 255, 255, 0.9);
+      border-radius: 12px;
+      padding: 30px;
+      margin-bottom: 30px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    }
+    .tool-section h1 {
+      margin-top: 0;
+      border-bottom: 3px solid #333;
+      padding-bottom: 10px;
+      color: #222;
+    }
+    .intro-text { line-height: 1.6; color: #333; margin-bottom: 25px; }
+    .intro-text em { color: maroon; font-style: italic; }
+    .form-box {
+      margin-bottom: 25px;
+      padding: 20px;
+      background-color: rgba(240, 240, 240, 0.6);
+      border-radius: 8px;
+      border-left: 4px solid maroon;
+    }
+    .form-box h3 { margin-top: 0; color: maroon; margin-bottom: 15px; }
+    .form-group { margin-bottom: 20px; }
+    .form-group:last-child { margin-bottom: 0; }
+    .form-group label { display: block; font-weight: bold; color: #003366; margin-bottom: 8px; }
+    input[type="file"] {
+      width: 100%;
+      padding: 12px;
+      border: 2px dashed #999;
+      border-radius: 6px;
+      background-color: rgba(255, 255, 255, 0.8);
+      font-family: inherit;
+      font-size: 1rem;
+      cursor: pointer;
+      box-sizing: border-box;
+    }
+    input[type="file"]:hover { border-color: maroon; }
+    input[type="file"]::file-selector-button {
+      padding: 8px 16px;
+      margin-right: 12px;
+      border: none;
+      border-radius: 4px;
+      background-color: maroon;
+      color: white;
+      cursor: pointer;
+    }
+    input[type="file"]::file-selector-button:hover { background-color: #003366; }
+    .radio-group { display: flex; flex-direction: column; gap: 10px; }
+    .radio-option {
+      display: flex;
+      align-items: flex-start;
+      padding: 12px 15px;
+      background-color: rgba(255, 255, 255, 0.8);
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+    .radio-option:hover { background-color: rgba(255, 255, 255, 0.95); border-color: #999; }
+    .radio-option.selected { border-color: maroon; border-left: 4px solid maroon; }
+    .radio-option input[type="radio"] { margin-right: 12px; margin-top: 3px; accent-color: maroon; }
+    .radio-label .title { color: #222; font-weight: bold; display: block; margin-bottom: 2px; }
+    .radio-label .desc { color: #666; font-size: 0.9em; }
+    .submit-btn {
+      width: 100%;
+      padding: 14px 30px;
+      border: none;
+      border-radius: 6px;
+      background-color: maroon;
+      color: white;
+      font-size: 1.1rem;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    .submit-btn:hover { background-color: #003366; }
+    .submit-btn:disabled { background-color: #999; cursor: wait; }
+    #status { margin-top: 20px; padding: 15px; border-radius: 6px; text-align: center; display: none; }
+    #status.loading { background-color: rgba(0, 51, 102, 0.1); border: 1px solid #003366; color: #003366; }
+    #status.success { background-color: rgba(0, 128, 0, 0.1); border: 1px solid green; color: green; }
+    #status.error { background-color: rgba(128, 0, 0, 0.1); border: 1px solid maroon; color: maroon; }
+    .examples-section { margin-top: 25px; padding-top: 20px; border-top: 2px solid #ddd; }
+    .examples-section h3 { margin-top: 0; color: #333; font-size: 1em; margin-bottom: 15px; }
+    .examples-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 20px; }
+    .example-item { color: #555; font-size: 0.95em; }
+    .example-item span { color: maroon; font-weight: 500; }
+    .back-link { display: block; text-align: center; margin-top: 20px; color: #ccc; text-decoration: none; }
+    .back-link:hover { color: white; }
+    @media (max-width: 600px) {
+      .tool-container { margin: 20px; padding: 15px; }
+      .examples-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="tool-container">
+    <div class="tool-section">
+      <h1>Gender Text Transformer</h1>
+      <p class="intro-text">
+        Upload a PDF document to transform gendered language while preserving 
+        the original formatting. This tool performs systematic substitution of 
+        gendered terms—<em>he</em> becomes <em>she</em>, <em>father</em> becomes 
+        <em>mother</em>, and so forth—allowing for experimental readings and 
+        critical engagement with texts.
+      </p>
+      <form id="uploadForm">
+        <div class="form-box">
+          <h3>Upload Document</h3>
+          <div class="form-group">
+            <label for="file">Select PDF File</label>
+            <input type="file" id="file" accept=".pdf" required>
+          </div>
+          <div class="form-group">
+            <label>Transformation Mode</label>
+            <div class="radio-group">
+              <label class="radio-option selected">
+                <input type="radio" name="direction" value="m_to_f" checked>
+                <div class="radio-label">
+                  <span class="title">Masculine → Feminine</span>
+                  <span class="desc">he, him, father, king → she, her, mother, queen</span>
+                </div>
+              </label>
+              <label class="radio-option">
+                <input type="radio" name="direction" value="f_to_m">
+                <div class="radio-label">
+                  <span class="title">Feminine → Masculine</span>
+                  <span class="desc">she, her, mother, queen → he, him, father, king</span>
+                </div>
+              </label>
+              <label class="radio-option">
+                <input type="radio" name="direction" value="swap">
+                <div class="radio-label">
+                  <span class="title">Swap Both</span>
+                  <span class="desc">Exchange all gendered terms bidirectionally</span>
+                </div>
+              </label>
+            </div>
+          </div>
+        </div>
+        <button type="submit" class="submit-btn" id="submitBtn">Transform Document</button>
+      </form>
+      <div id="status"></div>
+      <div class="examples-section">
+        <h3>Sample Transformations</h3>
+        <div class="examples-grid">
+          <div class="example-item">he/him/his → <span>she/her/hers</span></div>
+          <div class="example-item">Mr., Sir → <span>Ms., Madam</span></div>
+          <div class="example-item">father, son → <span>mother, daughter</span></div>
+          <div class="example-item">king, prince → <span>queen, princess</span></div>
+          <div class="example-item">brother, uncle → <span>sister, aunt</span></div>
+          <div class="example-item">husband, groom → <span>wife, bride</span></div>
+        </div>
+      </div>
+    </div>
+    <a href="https://criticaltheoryclub.neocities.org/sessions" class="back-link">← Back to Critical Theory Reading Group</a>
+  </div>
+  <script>
+    document.querySelectorAll('.radio-option').forEach(option => {
+      option.addEventListener('click', () => {
+        document.querySelectorAll('.radio-option').forEach(o => o.classList.remove('selected'));
+        option.classList.add('selected');
+      });
+    });
+    document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const fileInput = document.getElementById('file');
+      const direction = document.querySelector('input[name="direction"]:checked').value;
+      const status = document.getElementById('status');
+      const btn = document.getElementById('submitBtn');
+      if (!fileInput.files[0]) { showStatus('error', 'Please select a file.'); return; }
+      if (fileInput.files[0].size > 50 * 1024 * 1024) { showStatus('error', 'File exceeds 50MB limit.'); return; }
+      btn.disabled = true;
+      btn.textContent = 'Processing...';
+      if (direction === 'swap') {
+        showStatus('loading', 'Performing bidirectional swap (step 1 of 2)...');
+        try {
+          let formData = new FormData();
+          formData.append('file', fileInput.files[0]);
+          formData.append('direction', 'm_to_f');
+          let response = await fetch('/transform', { method: 'POST', body: formData });
+          if (!response.ok) throw new Error('First transformation failed');
+          let blob = await response.blob();
+          showStatus('loading', 'Performing bidirectional swap (step 2 of 2)...');
+          formData = new FormData();
+          formData.append('file', new File([blob], 'temp.pdf', { type: 'application/pdf' }));
+          formData.append('direction', 'f_to_m');
+          response = await fetch('/transform', { method: 'POST', body: formData });
+          if (!response.ok) throw new Error('Second transformation failed');
+          blob = await response.blob();
+          downloadBlob(blob, 'swapped_' + fileInput.files[0].name);
+          showStatus('success', 'Transformation complete. Download started.');
+          fileInput.value = '';
+        } catch (err) { showStatus('error', err.message); }
+        finally { btn.disabled = false; btn.textContent = 'Transform Document'; }
+        return;
+      }
+      showStatus('loading', 'Transforming document...');
+      const formData = new FormData();
+      formData.append('file', fileInput.files[0]);
+      formData.append('direction', direction);
+      try {
+        const response = await fetch('/transform', { method: 'POST', body: formData });
+        if (!response.ok) { let errorMsg = 'Transformation failed'; try { const err = await response.json(); errorMsg = err.error || errorMsg; } catch {} throw new Error(errorMsg); }
+        const blob = await response.blob();
+        downloadBlob(blob, 'transformed_' + fileInput.files[0].name);
+        showStatus('success', 'Transformation complete. Download started.');
+        fileInput.value = '';
+      } catch (err) { showStatus('error', err.message); }
+      finally { btn.disabled = false; btn.textContent = 'Transform Document'; }
+    });
+    function showStatus(type, message) { const status = document.getElementById('status'); status.style.display = 'block'; status.className = type; status.textContent = message; }
+    function downloadBlob(blob, filename) { const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url); }
+  </script>
+</body>
+</html>'''
+
+
+@app.route('/api')
+def api_info():
     return jsonify({
         "service": "Gender Text Transformer",
         "endpoints": {
