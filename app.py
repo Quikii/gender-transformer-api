@@ -10,7 +10,7 @@ from typing import List, Tuple, Literal
 
 from flask import Flask, request, send_file, jsonify, after_this_request
 from flask_cors import CORS
-import fitz  # pymupdf
+import fitz # pymupdf
 
 
 # =============================================================================
@@ -83,6 +83,7 @@ def transform_text(text: str, direction: str = 'm_to_f') -> str:
     
     mappings = build_mappings(direction)
     
+    # Handle his/hers
     if direction == 'm_to_f':
         text = re.sub(
             r'\bhis\b(?=\s+[a-zA-Z])',
@@ -101,10 +102,12 @@ def transform_text(text: str, direction: str = 'm_to_f') -> str:
             text, flags=re.IGNORECASE
         )
     
+    # Handle general mapping
     for source, target in mappings.items():
         if source in ('his', 'hers'):
             continue
         
+        # Handle her/him
         if source == 'her' and direction == 'f_to_m':
             text = re.sub(
                 r'\bher\b(?=\s+[a-zA-Z])',
@@ -129,22 +132,21 @@ def transform_text(text: str, direction: str = 'm_to_f') -> str:
 
 
 # =============================================================================
-# PDF Processing (FIXED & OPTIMIZED)
+# PDF Processing (FINAL VERSION)
 # =============================================================================
 
 def normalize_text(text: str) -> str:
     """
-    Fixes the 'dots' issue by replacing unsupported unicode characters 
-    with their ASCII equivalents.
+    Replaces common unsupported Unicode characters with ASCII equivalents.
     """
     replacements = {
-        "\u2018": "'",  # Left single quote
-        "\u2019": "'",  # Right single quote (apostrophe)
-        "\u201C": '"',  # Left double quote
-        "\u201D": '"',  # Right double quote
-        "\u2013": "-",  # En dash
-        "\u2014": "-",  # Em dash
-        "…": "...",     # Ellipsis
+        "\u2018": "'",   # Left single quote
+        "\u2019": "'",   # Right single quote (apostrophe)
+        "\u201C": '"',   # Left double quote
+        "\u201D": '"',   # Right double quote
+        "\u2013": "-",   # En dash
+        "\u2014": "-",   # Em dash
+        "…": "...",       # Ellipsis
     }
     for char, replacement in replacements.items():
         text = text.replace(char, replacement)
@@ -165,19 +167,32 @@ def get_text_spans(page):
                     "font": span["font"],
                     "size": span["size"],
                     "color": span["color"],
-                    "origin": span["origin"], # This comes as a sequence, we convert to Point later
+                    "origin": fitz.Point(span["origin"]), # Ensure Point object is created
                 })
     return spans
 
 def find_matching_font(original_font: str) -> str:
-    # Improved mapping to handle bold/italic better
+    """
+    Maps font names to PyMuPDF's built-in Base 14 PDF fonts,
+    including specific variants for bold/italic to resolve 'helvi' type errors.
+    """
     original_font = original_font.lower()
-    if "bold" in original_font and "times" in original_font: return "tib"
-    if "bold" in original_font and "courier" in original_font: return "cob"
-    if "bold" in original_font: return "helvb" # Default bold
-    if "italic" in original_font and "times" in original_font: return "tii"
-    if "italic" in original_font: return "helvi" # Default italic
     
+    # Check for bold/italic variants first
+    if "bold" in original_font and "italic" in original_font:
+        if "times" in original_font or "roman" in original_font: return "tibi"
+        if "courier" in original_font or "mono" in original_font: return "cobi"
+        return "helvbi"
+    if "bold" in original_font:
+        if "times" in original_font or "roman" in original_font: return "tib"
+        if "courier" in original_font or "mono" in original_font: return "cob"
+        return "helvb"
+    if "italic" in original_font or "oblique" in original_font:
+        if "times" in original_font or "roman" in original_font: return "tii"
+        if "courier" in original_font or "mono" in original_font: return "coi"
+        return "helvi" # This is the one that caused the original error, but is necessary for italic
+    
+    # Check for base names
     font_fallbacks = {
         "arial": "helv", "helvetica": "helv",
         "times": "tiro", "roman": "tiro",
@@ -186,14 +201,16 @@ def find_matching_font(original_font: str) -> str:
     for key, value in font_fallbacks.items():
         if key in original_font:
             return value
-    return "helv"
+            
+    return "helv" # Final default fallback
+
 
 def transform_pdf(input_path: str, output_path: str, direction: str = 'm_to_f') -> dict:
     doc = fitz.open(input_path)
     stats = {"pages_processed": 0, "spans_modified": 0}
     
-    # Pre-load base fonts to calculate text length
-    font_cache = {} 
+    # Cache font objects for width calculation efficiency
+    font_cache = {}  
     
     for page in doc:
         spans = get_text_spans(page)
@@ -203,13 +220,11 @@ def transform_pdf(input_path: str, output_path: str, direction: str = 'm_to_f') 
         for span in spans:
             original_text = span["text"]
             
-            # Apply your regex transformation logic
             try:
                 transformed_text = transform_text(original_text, direction) 
             except Exception:
                 transformed_text = original_text
             
-            # Fix "dots" by normalizing Unicode
             transformed_text = normalize_text(transformed_text)
 
             if original_text != transformed_text:
@@ -226,10 +241,9 @@ def transform_pdf(input_path: str, output_path: str, direction: str = 'm_to_f') 
         if not modifications:
             continue
 
-        # 2. Redact old text (Process all redactions first to clear the canvas)
+        # 2. Redact old text
         for mod in modifications:
-            bbox = mod["bbox"]
-            page.add_redact_annot(bbox) 
+            page.add_redact_annot(mod["bbox"]) 
         
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
@@ -237,46 +251,51 @@ def transform_pdf(input_path: str, output_path: str, direction: str = 'm_to_f') 
         for mod in modifications:
             fontname = find_matching_font(mod["font"])
             
-            # Instantiate font object to calculate width
+            # --- Calculate Scale Factor ---
             if fontname not in font_cache:
-                font_cache[fontname] = fitz.Font(fontname)
-            font_obj = font_cache[fontname]
+                try:
+                    font_cache[fontname] = fitz.Font(fontname)
+                except:
+                    # Fallback font for calculation if the primary one fails
+                    fontname = "helv"
+                    font_cache[fontname] = fitz.Font(fontname)
 
-            # Calculate Scale Factor
+            font_obj = font_cache[fontname]
+            
             new_text_width = font_obj.text_length(mod["transformed"], fontsize=mod["size"])
             original_width = mod["bbox"].width
             
             scale_x = 1.0
-            if new_text_width > 0:
-                scale_x = original_width / new_text_width
-            
-            # Clamp scaling (prevent extreme stretching)
-            scale_x = max(0.6, min(scale_x, 1.5))
+            if new_text_width > 0 and original_width > 0:
+                # Calculate scale, ensuring it stays within a reasonable range (0.6 to 1.5)
+                scale_x = max(0.6, min(original_width / new_text_width, 1.5))
 
+            # Create the transformation matrix (Trm) for horizontal scaling
+            # Trm is [scale_x, shear_y, shear_x, scale_y, offset_x, offset_y]
+            trm = fitz.Matrix(scale_x, 0, 0, 1, 0, 0)
+            
             # Extract color
             color_int = mod["color"]
             r = ((color_int >> 16) & 0xFF) / 255.0
             g = ((color_int >> 8) & 0xFF) / 255.0
             b = (color_int & 0xFF) / 255.0
 
-            # Convert origin tuple to Point object (Critical for morph!)
-            origin_pt = fitz.Point(mod["origin"])
-
             try:
-                page.insert_text(
-                    mod["origin"], mod["transformed"],
-                    fontname=fontname, fontsize=mod["size"], color=(r, g, b)
-                )
-            except:
-                # First fallback (remove fontname)
-                try:
-                    page.insert_text(mod["origin"], mod["transformed"], fontsize=mod["size"])
-                except:
-                    # Final fallback (use an absolutely safe font)
-                    try:
-                        page.insert_text(mod["origin"], mod["transformed"], fontname="cour", fontsize=mod["size"])
-                    except:
-                        pass
+                page.insert_text(
+                    mod["origin"], mod["transformed"],
+                    fontname=fontname, fontsize=mod["size"], color=(r, g, b),
+                    trm=trm # <-- Applies the calculated horizontal scaling
+                )
+            except:
+                # Fallback 1: Remove fontname and Trm, rely on PyMuPDF's default text insertion
+                try:
+                    page.insert_text(mod["origin"], mod["transformed"], fontsize=mod["size"])
+                except:
+                    # Final Fallback 2: Use the most basic "cour" font
+                    try:
+                        page.insert_text(mod["origin"], mod["transformed"], fontname="cour", fontsize=mod["size"])
+                    except:
+                        pass
 
         stats["pages_processed"] += 1
         stats["spans_modified"] += len(modifications)
@@ -301,11 +320,12 @@ CORS(app, resources={
     }
 })
 
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024 # 50MB max
 
 
 @app.route('/')
 def index():
+    # HTML template remains the same for the frontend interface
     return '''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -582,7 +602,7 @@ def transform():
         with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_out:
             output_path = tmp_out.name
         
-        # Transform (Now using the fixed function)
+        # Transform
         stats = transform_pdf(input_path, output_path, direction)
         
         # Clean up input immediately
@@ -611,9 +631,11 @@ def transform():
     except Exception as e:
         # If something went wrong, clean up now
         if input_path and os.path.exists(input_path):
-            os.unlink(input_path)
+            try: os.unlink(input_path)
+            except: pass
         if output_path and os.path.exists(output_path):
-            os.unlink(output_path)
+            try: os.unlink(output_path)
+            except: pass
         return jsonify({'error': str(e)}), 500
 
 
