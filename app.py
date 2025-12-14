@@ -135,41 +135,36 @@ def transform_text(text: str, direction: str = 'm_to_f') -> str:
 def normalize_text(text: str) -> str:
     """Normalize special characters to ASCII equivalents for better font compatibility."""
     replacements = {
-        # Curly quotes to straight quotes
         ''': "'", ''': "'", '"': '"', '"': '"',
-        # Other common problematic characters
         '–': '-', '—': '-', '…': '...',
         'ﬁ': 'fi', 'ﬂ': 'fl', 'ﬀ': 'ff', 'ﬃ': 'ffi', 'ﬄ': 'ffl',
         '′': "'", '″': '"',
-        '\u00a0': ' ',  # Non-breaking space
-        '\u2019': "'",  # Right single quotation mark
-        '\u2018': "'",  # Left single quotation mark
-        '\u201c': '"',  # Left double quotation mark
-        '\u201d': '"',  # Right double quotation mark
+        '\u00a0': ' ', '\u2019': "'", '\u2018': "'",
+        '\u201c': '"', '\u201d': '"',
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
     return text
 
 
-def get_text_spans(page):
-    spans = []
+def get_font_info_at_point(page, point):
+    """Get font information at a specific point on the page."""
     blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
     for block in blocks:
         if block.get("type") != 0:
             continue
         for line in block.get("lines", []):
             for span in line.get("spans", []):
-                spans.append({
-                    "text": span["text"],
-                    "bbox": fitz.Rect(span["bbox"]),
-                    "font": span["font"],
-                    "size": span["size"],
-                    "color": span["color"],
-                    "origin": span["origin"],
-                    "flags": span.get("flags", 0),  # Store font flags (bold, italic, etc.)
-                })
-    return spans
+                bbox = fitz.Rect(span["bbox"])
+                if bbox.contains(point):
+                    return {
+                        "font": span["font"],
+                        "size": span["size"],
+                        "color": span["color"],
+                        "origin": span["origin"],
+                    }
+    # Default fallback
+    return {"font": "Helvetica", "size": 11, "color": 0, "origin": point}
 
 
 def find_matching_font(original_font: str) -> str:
@@ -184,51 +179,107 @@ def find_matching_font(original_font: str) -> str:
     return "helv"
 
 
-def get_background_color(page, rect):
-    """Try to detect the background color at a given rectangle."""
-    # Default to white
-    return (1, 1, 1)
+def build_word_list(direction: str) -> list:
+    """Build list of (source_word, target_word) tuples to search for."""
+    words_to_find = []
+    mappings = build_mappings(direction)
+    
+    # Add all words from mappings
+    for source, target in mappings.items():
+        if source not in ('his', 'hers', 'her'):  # Handle these specially
+            words_to_find.append((source, target))
+    
+    # Handle possessives specially based on direction
+    if direction == 'm_to_f':
+        # "his" can become "her" or "hers" depending on context
+        # We'll just use "her" as it's more common (possessive adjective)
+        words_to_find.append(('his', 'her'))
+    else:
+        words_to_find.append(('hers', 'his'))
+        words_to_find.append(('her', 'his'))  # This is imperfect but workable
+    
+    return words_to_find
 
 
 def transform_pdf(input_path: str, output_path: str, direction: str = 'm_to_f') -> dict:
     doc = fitz.open(input_path)
     stats = {"pages_processed": 0, "spans_modified": 0, "words_changed": []}
     
+    words_to_find = build_word_list(direction)
+    
     for page in doc:
-        spans = get_text_spans(page)
-        modifications = []
+        replacements = []  # List of (rect, original, replacement, font_info)
         
-        for span in spans:
-            original_text = span["text"]
-            transformed_text = transform_text(original_text, direction)
+        # Search for each word that needs replacing
+        for source_word, target_word in words_to_find:
+            # Search for different case variants
+            variants = [
+                (source_word.lower(), target_word.lower()),
+                (source_word.capitalize(), target_word.capitalize()),
+                (source_word.upper(), target_word.upper()),
+            ]
             
-            if original_text != transformed_text:
-                # Normalize special characters in the transformed text
-                transformed_text = normalize_text(transformed_text)
+            for source_variant, target_variant in variants:
+                # Find all instances of this word on the page
+                rects = page.search_for(source_variant, quads=False)
                 
-                modifications.append({
-                    "original": original_text,
-                    "transformed": transformed_text,
-                    "bbox": span["bbox"],
-                    "font": span["font"],
-                    "size": span["size"],
-                    "color": span["color"],
-                    "origin": span["origin"],
-                    "flags": span.get("flags", 0),
-                })
+                for rect in rects:
+                    # Verify it's a whole word by checking characters before/after
+                    # Get text in a slightly expanded area
+                    expanded = fitz.Rect(rect.x0 - 10, rect.y0, rect.x1 + 10, rect.y1)
+                    surrounding_text = page.get_text("text", clip=expanded)
+                    
+                    # Simple word boundary check
+                    # Find position of our word in surrounding text
+                    idx = surrounding_text.lower().find(source_variant.lower())
+                    if idx != -1:
+                        # Check character before
+                        if idx > 0:
+                            char_before = surrounding_text[idx - 1]
+                            if char_before.isalnum():
+                                continue  # Part of a larger word
+                        # Check character after
+                        end_idx = idx + len(source_variant)
+                        if end_idx < len(surrounding_text):
+                            char_after = surrounding_text[end_idx]
+                            if char_after.isalnum():
+                                continue  # Part of a larger word
+                    
+                    # Get font info from this location
+                    center_point = fitz.Point(rect.x0 + 1, (rect.y0 + rect.y1) / 2)
+                    font_info = get_font_info_at_point(page, center_point)
+                    
+                    replacements.append({
+                        "rect": rect,
+                        "original": source_variant,
+                        "replacement": normalize_text(target_variant),
+                        "font_info": font_info,
+                    })
         
-        # First pass: apply all redactions with larger coverage area
-        for mod in modifications:
-            bbox = mod["bbox"]
-            # Expand the redaction rectangle more generously to ensure full coverage
-            # Expand vertically based on font size, horizontally with fixed padding
-            v_padding = mod["size"] * 0.15  # 15% of font size
-            h_padding = 3.8
+        # Remove duplicates (same rect)
+        seen_rects = set()
+        unique_replacements = []
+        for r in replacements:
+            rect_key = (round(r["rect"].x0, 1), round(r["rect"].y0, 1), 
+                       round(r["rect"].x1, 1), round(r["rect"].y1, 1))
+            if rect_key not in seen_rects:
+                seen_rects.add(rect_key)
+                unique_replacements.append(r)
+        
+        # Apply redactions
+        for r in unique_replacements:
+            rect = r["rect"]
+            font_size = r["font_info"]["size"]
+            
+            # Padding based on font size
+            v_padding = font_size * 0.3
+            h_padding = 2.0
+            
             redact_rect = fitz.Rect(
-                bbox.x0 - h_padding,
-                bbox.y0 - v_padding,
-                bbox.x1 + h_padding,
-                bbox.y1 + v_padding
+                rect.x0 - h_padding,
+                rect.y0 - v_padding,
+                rect.x1 + h_padding,
+                rect.y1 + v_padding
             )
             annot = page.add_redact_annot(redact_rect)
             annot.set_colors(stroke=(1, 1, 1), fill=(1, 1, 1))
@@ -237,48 +288,50 @@ def transform_pdf(input_path: str, output_path: str, direction: str = 'm_to_f') 
         # Apply all redactions at once
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
         
-        # Second pass: insert new text
-        for mod in modifications:
-            fontname = find_matching_font(mod["font"])
-            color_int = mod["color"]
-            r = ((color_int >> 16) & 0xFF) / 255.0
-            g = ((color_int >> 8) & 0xFF) / 255.0
-            b = (color_int & 0xFF) / 255.0
+        # Insert replacement text
+        for r in unique_replacements:
+            font_info = r["font_info"]
+            fontname = find_matching_font(font_info["font"])
             
-            # Get the insertion point - use the original origin
-            # which should be the baseline of the text
-            insertion_point = mod["origin"]
+            color_int = font_info["color"]
+            if isinstance(color_int, int):
+                red = ((color_int >> 16) & 0xFF) / 255.0
+                green = ((color_int >> 8) & 0xFF) / 255.0
+                blue = (color_int & 0xFF) / 255.0
+            else:
+                red, green, blue = 0, 0, 0
+            
+            # Calculate insertion point (bottom-left of rect, adjusted for baseline)
+            rect = r["rect"]
+            # Use the baseline from font_info if available, otherwise estimate
+            if "origin" in font_info and font_info["origin"]:
+                insertion_point = fitz.Point(rect.x0, font_info["origin"][1])
+            else:
+                # Estimate baseline as ~80% down from top of rect
+                baseline_y = rect.y0 + (rect.height * 0.8)
+                insertion_point = fitz.Point(rect.x0, baseline_y)
             
             try:
-                # Try to insert with the matched font
                 page.insert_text(
                     insertion_point,
-                    mod["transformed"],
+                    r["replacement"],
                     fontname=fontname,
-                    fontsize=mod["size"],
-                    color=(r, g, b),
+                    fontsize=font_info["size"],
+                    color=(red, green, blue),
                     encoding=fitz.TEXT_ENCODING_UTF8
                 )
+                stats["words_changed"].append((r["original"], r["replacement"]))
             except Exception as e:
-                # Fallback: try with default encoding
+                # Fallback with simpler parameters
                 try:
                     page.insert_text(
                         insertion_point,
-                        mod["transformed"],
+                        r["replacement"],
                         fontname="helv",
-                        fontsize=mod["size"],
-                        color=(r, g, b)
+                        fontsize=font_info["size"]
                     )
                 except:
-                    # Last resort: insert with minimal parameters
-                    try:
-                        page.insert_text(
-                            insertion_point,
-                            mod["transformed"],
-                            fontsize=mod["size"]
-                        )
-                    except:
-                        pass  # Skip if all attempts fail
+                    pass
         
         stats["pages_processed"] += 1
     
