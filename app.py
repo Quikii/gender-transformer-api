@@ -80,9 +80,9 @@ def build_mappings(direction: str) -> dict:
 def transform_text(text: str, direction: str = 'm_to_f') -> str:
     if not text or not text.strip():
         return text
-
+    
     mappings = build_mappings(direction)
-
+    
     if direction == 'm_to_f':
         text = re.sub(
             r'\bhis\b(?=\s+[a-zA-Z])',
@@ -100,11 +100,11 @@ def transform_text(text: str, direction: str = 'm_to_f') -> str:
             lambda m: preserve_case(m.group(), 'his'),
             text, flags=re.IGNORECASE
         )
-
+    
     for source, target in mappings.items():
         if source in ('his', 'hers'):
             continue
-
+        
         if source == 'her' and direction == 'f_to_m':
             text = re.sub(
                 r'\bher\b(?=\s+[a-zA-Z])',
@@ -117,20 +117,40 @@ def transform_text(text: str, direction: str = 'm_to_f') -> str:
                 text, flags=re.IGNORECASE
             )
             continue
-
+        
         pattern = rf'\b{re.escape(source)}\b'
         text = re.sub(
             pattern,
             lambda m, t=target: preserve_case(m.group(), t),
             text, flags=re.IGNORECASE
         )
-
+    
     return text
 
 
 # =============================================================================
 # PDF Processing
 # =============================================================================
+
+def normalize_text(text: str) -> str:
+    """Normalize special characters to ASCII equivalents for better font compatibility."""
+    replacements = {
+        # Curly quotes to straight quotes
+        ''': "'", ''': "'", '"': '"', '"': '"',
+        # Other common problematic characters
+        '–': '-', '—': '-', '…': '...',
+        'ﬁ': 'fi', 'ﬂ': 'fl', 'ﬀ': 'ff', 'ﬃ': 'ffi', 'ﬄ': 'ffl',
+        '′': "'", '″': '"',
+        '\u00a0': ' ',  # Non-breaking space
+        '\u2019': "'",  # Right single quotation mark
+        '\u2018': "'",  # Left single quotation mark
+        '\u201c': '"',  # Left double quotation mark
+        '\u201d': '"',  # Right double quotation mark
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    return text
+
 
 def get_text_spans(page):
     spans = []
@@ -147,6 +167,7 @@ def get_text_spans(page):
                     "size": span["size"],
                     "color": span["color"],
                     "origin": span["origin"],
+                    "flags": span.get("flags", 0),  # Store font flags (bold, italic, etc.)
                 })
     return spans
 
@@ -163,19 +184,28 @@ def find_matching_font(original_font: str) -> str:
     return "helv"
 
 
+def get_background_color(page, rect):
+    """Try to detect the background color at a given rectangle."""
+    # Default to white
+    return (1, 1, 1)
+
+
 def transform_pdf(input_path: str, output_path: str, direction: str = 'm_to_f') -> dict:
     doc = fitz.open(input_path)
     stats = {"pages_processed": 0, "spans_modified": 0, "words_changed": []}
-
+    
     for page in doc:
         spans = get_text_spans(page)
         modifications = []
-
+        
         for span in spans:
             original_text = span["text"]
             transformed_text = transform_text(original_text, direction)
-
+            
             if original_text != transformed_text:
+                # Normalize special characters in the transformed text
+                transformed_text = normalize_text(transformed_text)
+                
                 modifications.append({
                     "original": original_text,
                     "transformed": transformed_text,
@@ -184,37 +214,74 @@ def transform_pdf(input_path: str, output_path: str, direction: str = 'm_to_f') 
                     "size": span["size"],
                     "color": span["color"],
                     "origin": span["origin"],
+                    "flags": span.get("flags", 0),
                 })
-
-        for mod in reversed(modifications):
+        
+        # First pass: apply all redactions with larger coverage area
+        for mod in modifications:
             bbox = mod["bbox"]
-            redact_rect = fitz.Rect(bbox.x0 - 0.5, bbox.y0 - 0.5, bbox.x1 + 0.5, bbox.y1 + 0.5)
+            # Expand the redaction rectangle more generously to ensure full coverage
+            # Expand vertically based on font size, horizontally with fixed padding
+            v_padding = mod["size"] * 0.15  # 15% of font size
+            h_padding = 1.0
+            redact_rect = fitz.Rect(
+                bbox.x0 - h_padding,
+                bbox.y0 - v_padding,
+                bbox.x1 + h_padding,
+                bbox.y1 + v_padding
+            )
             annot = page.add_redact_annot(redact_rect)
             annot.set_colors(stroke=(1, 1, 1), fill=(1, 1, 1))
             stats["spans_modified"] += 1
-
+        
+        # Apply all redactions at once
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-
+        
+        # Second pass: insert new text
         for mod in modifications:
             fontname = find_matching_font(mod["font"])
             color_int = mod["color"]
             r = ((color_int >> 16) & 0xFF) / 255.0
             g = ((color_int >> 8) & 0xFF) / 255.0
             b = (color_int & 0xFF) / 255.0
-
+            
+            # Get the insertion point - use the original origin
+            # which should be the baseline of the text
+            insertion_point = mod["origin"]
+            
             try:
+                # Try to insert with the matched font
                 page.insert_text(
-                    mod["origin"], mod["transformed"],
-                    fontname=fontname, fontsize=mod["size"], color=(r, g, b)
+                    insertion_point,
+                    mod["transformed"],
+                    fontname=fontname,
+                    fontsize=mod["size"],
+                    color=(r, g, b),
+                    encoding=fitz.TEXT_ENCODING_UTF8
                 )
-            except:
+            except Exception as e:
+                # Fallback: try with default encoding
                 try:
-                    page.insert_text(mod["origin"], mod["transformed"], fontsize=mod["size"])
+                    page.insert_text(
+                        insertion_point,
+                        mod["transformed"],
+                        fontname="helv",
+                        fontsize=mod["size"],
+                        color=(r, g, b)
+                    )
                 except:
-                    pass
-
+                    # Last resort: insert with minimal parameters
+                    try:
+                        page.insert_text(
+                            insertion_point,
+                            mod["transformed"],
+                            fontsize=mod["size"]
+                        )
+                    except:
+                        pass  # Skip if all attempts fail
+        
         stats["pages_processed"] += 1
-
+    
     doc.save(output_path, garbage=4, deflate=True)
     doc.close()
     return stats
@@ -225,7 +292,6 @@ def transform_pdf(input_path: str, output_path: str, direction: str = 'm_to_f') 
 # =============================================================================
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
 
 # Enable CORS for all routes with explicit settings
 CORS(app, resources={
@@ -492,34 +558,34 @@ def health():
 def transform():
     if 'file' not in request.files:
         return jsonify({'error': 'No file provided'}), 400
-
+    
     file = request.files['file']
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
-
+    
     if not file.filename.lower().endswith('.pdf'):
         return jsonify({'error': 'File must be a PDF'}), 400
-
+    
     direction = request.form.get('direction', 'm_to_f')
     if direction not in ('m_to_f', 'f_to_m'):
         return jsonify({'error': 'Invalid direction. Use m_to_f or f_to_m'}), 400
-
+    
     input_path = None
     output_path = None
-
+    
     try:
         # Save uploaded file
         with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_in:
             file.save(tmp_in.name)
             input_path = tmp_in.name
-
+        
         # Create output file
         with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_out:
             output_path = tmp_out.name
-
+        
         # Transform
         stats = transform_pdf(input_path, output_path, direction)
-
+        
         # Send result
         return send_file(
             output_path,
@@ -527,10 +593,10 @@ def transform():
             as_attachment=True,
             download_name=f'transformed_{file.filename}'
         )
-
+        
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
+    
     finally:
         # Cleanup
         if input_path and os.path.exists(input_path):
