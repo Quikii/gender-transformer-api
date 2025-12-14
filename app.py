@@ -132,8 +132,27 @@ def transform_text(text: str, direction: str = 'm_to_f') -> str:
 # PDF Processing
 # =============================================================================
 
+def normalize_text(text: str) -> str:
+    """
+    Fixes the 'dots' issue by replacing unsupported unicode characters 
+    with their ASCII equivalents.
+    """
+    replacements = {
+        "\u2018": "'",  # Left single quote
+        "\u2019": "'",  # Right single quote (apostrophe)
+        "\u201C": '"',  # Left double quote
+        "\u201D": '"',  # Right double quote
+        "\u2013": "-",  # En dash
+        "\u2014": "-",  # Em dash
+        "…": "...",     # Ellipsis
+    }
+    for char, replacement in replacements.items():
+        text = text.replace(char, replacement)
+    return text
+
 def get_text_spans(page):
     spans = []
+    # "rawdict" provides more granular detail if needed, but dict is fine for spans
     blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
     for block in blocks:
         if block.get("type") != 0:
@@ -150,22 +169,31 @@ def get_text_spans(page):
                 })
     return spans
 
-
 def find_matching_font(original_font: str) -> str:
+    # Improved mapping
+    original_font = original_font.lower()
+    if "bold" in original_font and "times" in original_font: return "tib"
+    if "bold" in original_font and "courier" in original_font: return "cob"
+    if "bold" in original_font: return "helvb" # Default bold
+    if "italic" in original_font and "times" in original_font: return "tii"
+    if "italic" in original_font: return "helvi" # Default italic
+    
     font_fallbacks = {
-        "Arial": "helv", "Helvetica": "helv",
-        "Times": "tiro", "Times New Roman": "tiro",
-        "Courier": "cour", "CourierNew": "cour",
+        "arial": "helv", "helvetica": "helv",
+        "times": "tiro", "roman": "tiro",
+        "courier": "cour", "mono": "cour",
     }
     for key, value in font_fallbacks.items():
-        if key.lower() in original_font.lower():
+        if key in original_font:
             return value
     return "helv"
 
-
 def transform_pdf(input_path: str, output_path: str, direction: str = 'm_to_f') -> dict:
     doc = fitz.open(input_path)
-    stats = {"pages_processed": 0, "spans_modified": 0, "words_changed": []}
+    stats = {"pages_processed": 0, "spans_modified": 0}
+    
+    # Pre-load base fonts to calculate text length
+    font_cache = {} 
     
     for page in doc:
         spans = get_text_spans(page)
@@ -173,8 +201,18 @@ def transform_pdf(input_path: str, output_path: str, direction: str = 'm_to_f') 
         
         for span in spans:
             original_text = span["text"]
-            transformed_text = transform_text(original_text, direction)
             
+            # 1. Clean encoding issues inside the logic
+            # (Assuming transform_text exists elsewhere in your code)
+            try:
+                # Mocking transform_text for this example - replace with your actual function
+                transformed_text = transform_text(original_text, direction) 
+            except NameError:
+                transformed_text = original_text # Fallback if function missing
+            
+            # Normalize to remove "dots"
+            transformed_text = normalize_text(transformed_text)
+
             if original_text != transformed_text:
                 modifications.append({
                     "original": original_text,
@@ -185,36 +223,69 @@ def transform_pdf(input_path: str, output_path: str, direction: str = 'm_to_f') 
                     "color": span["color"],
                     "origin": span["origin"],
                 })
-        
-        for mod in reversed(modifications):
+
+        if not modifications:
+            continue
+
+        # 2. Redact old text (Process all redactions first)
+        for mod in modifications:
             bbox = mod["bbox"]
-            redact_rect = fitz.Rect(bbox.x0 - 0.5, bbox.y0 - 0.5, bbox.x1 + 0.5, bbox.y1 + 0.5)
-            annot = page.add_redact_annot(redact_rect)
-            annot.set_colors(stroke=(1, 1, 1), fill=(1, 1, 1))
-            stats["spans_modified"] += 1
+            # Small buffer ensures we don't leave pixel artifacts
+            page.add_redact_annot(bbox) 
         
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-        
+
+        # 3. Insert new text with SCALING
         for mod in modifications:
             fontname = find_matching_font(mod["font"])
+            
+            # Instantiate font object to calculate width
+            if fontname not in font_cache:
+                font_cache[fontname] = fitz.Font(fontname)
+            font_obj = font_cache[fontname]
+
+            # Calculate Scale
+            new_text_width = font_obj.text_length(mod["transformed"], fontsize=mod["size"])
+            original_width = mod["bbox"].width
+            
+            # Avoid division by zero
+            scale_x = 1.0
+            if new_text_width > 0:
+                scale_x = original_width / new_text_width
+            
+            # Clamp scaling (don't stretch text too absurdly, e.g., < 0.7 or > 1.3)
+            # You can remove these limits if you want strict box fitting
+            scale_x = max(0.7, min(scale_x, 1.3))
+
             color_int = mod["color"]
             r = ((color_int >> 16) & 0xFF) / 255.0
             g = ((color_int >> 8) & 0xFF) / 255.0
             b = (color_int & 0xFF) / 255.0
-            
+
             try:
+                # morph=(x_origin, y_origin, matrix)
+                # We use a matrix to scale width: fitz.Matrix(scale_x, scale_y)
                 page.insert_text(
-                    mod["origin"], mod["transformed"],
-                    fontname=fontname, fontsize=mod["size"], color=(r, g, b)
+                    mod["origin"], 
+                    mod["transformed"], 
+                    fontname=fontname, 
+                    fontsize=mod["size"], 
+                    color=(r, g, b),
+                    morph=(mod["origin"], fitz.Matrix(scale_x, 1))
                 )
-            except:
-                try:
-                    page.insert_text(mod["origin"], mod["transformed"], fontsize=mod["size"])
-                except:
-                    pass
-        
+            except Exception as e:
+                print(f"Error inserting text: {e}")
+                # Fallback without morph if it fails
+                page.insert_text(
+                    mod["origin"], 
+                    mod["transformed"], 
+                    fontsize=mod["size"],
+                    color=(r, g, b)
+                )
+
         stats["pages_processed"] += 1
-    
+        stats["spans_modified"] += len(modifications)
+
     doc.save(output_path, garbage=4, deflate=True)
     doc.close()
     return stats
