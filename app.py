@@ -8,7 +8,7 @@ import re
 from dataclasses import dataclass
 from typing import List, Tuple, Literal
 
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, send_file, jsonify, after_this_request
 from flask_cors import CORS
 import fitz  # pymupdf
 
@@ -129,7 +129,7 @@ def transform_text(text: str, direction: str = 'm_to_f') -> str:
 
 
 # =============================================================================
-# PDF Processing
+# PDF Processing (FIXED & OPTIMIZED)
 # =============================================================================
 
 def normalize_text(text: str) -> str:
@@ -152,7 +152,7 @@ def normalize_text(text: str) -> str:
 
 def get_text_spans(page):
     spans = []
-    # "rawdict" provides more granular detail if needed, but dict is fine for spans
+    # "dict" gives us text, font, size, and bbox
     blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
     for block in blocks:
         if block.get("type") != 0:
@@ -165,12 +165,12 @@ def get_text_spans(page):
                     "font": span["font"],
                     "size": span["size"],
                     "color": span["color"],
-                    "origin": span["origin"],
+                    "origin": span["origin"], # This comes as a sequence, we convert to Point later
                 })
     return spans
 
 def find_matching_font(original_font: str) -> str:
-    # Improved mapping
+    # Improved mapping to handle bold/italic better
     original_font = original_font.lower()
     if "bold" in original_font and "times" in original_font: return "tib"
     if "bold" in original_font and "courier" in original_font: return "cob"
@@ -199,18 +199,17 @@ def transform_pdf(input_path: str, output_path: str, direction: str = 'm_to_f') 
         spans = get_text_spans(page)
         modifications = []
         
+        # 1. Identify all modifications needed on this page
         for span in spans:
             original_text = span["text"]
             
-            # 1. Clean encoding issues inside the logic
-            # (Assuming transform_text exists elsewhere in your code)
+            # Apply your regex transformation logic
             try:
-                # Mocking transform_text for this example - replace with your actual function
                 transformed_text = transform_text(original_text, direction) 
-            except NameError:
-                transformed_text = original_text # Fallback if function missing
+            except Exception:
+                transformed_text = original_text
             
-            # Normalize to remove "dots"
+            # Fix "dots" by normalizing Unicode
             transformed_text = normalize_text(transformed_text)
 
             if original_text != transformed_text:
@@ -227,15 +226,14 @@ def transform_pdf(input_path: str, output_path: str, direction: str = 'm_to_f') 
         if not modifications:
             continue
 
-        # 2. Redact old text (Process all redactions first)
+        # 2. Redact old text (Process all redactions first to clear the canvas)
         for mod in modifications:
             bbox = mod["bbox"]
-            # Small buffer ensures we don't leave pixel artifacts
             page.add_redact_annot(bbox) 
         
         page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
-        # 3. Insert new text with SCALING
+        # 3. Insert new text with SCALING (Morphing)
         for mod in modifications:
             fontname = find_matching_font(mod["font"])
             
@@ -244,44 +242,48 @@ def transform_pdf(input_path: str, output_path: str, direction: str = 'm_to_f') 
                 font_cache[fontname] = fitz.Font(fontname)
             font_obj = font_cache[fontname]
 
-            # Calculate Scale
+            # Calculate Scale Factor
             new_text_width = font_obj.text_length(mod["transformed"], fontsize=mod["size"])
             original_width = mod["bbox"].width
             
-            # Avoid division by zero
             scale_x = 1.0
             if new_text_width > 0:
                 scale_x = original_width / new_text_width
             
-            # Clamp scaling (don't stretch text too absurdly, e.g., < 0.7 or > 1.3)
-            # You can remove these limits if you want strict box fitting
-            scale_x = max(0.7, min(scale_x, 1.3))
+            # Clamp scaling (prevent extreme stretching)
+            scale_x = max(0.6, min(scale_x, 1.5))
 
+            # Extract color
             color_int = mod["color"]
             r = ((color_int >> 16) & 0xFF) / 255.0
             g = ((color_int >> 8) & 0xFF) / 255.0
             b = (color_int & 0xFF) / 255.0
 
+            # Convert origin tuple to Point object (Critical for morph!)
+            origin_pt = fitz.Point(mod["origin"])
+
             try:
-                # morph=(x_origin, y_origin, matrix)
-                # We use a matrix to scale width: fitz.Matrix(scale_x, scale_y)
+                # morph=(origin, matrix) scales the text horizontally
                 page.insert_text(
-                    mod["origin"], 
+                    origin_pt, 
                     mod["transformed"], 
                     fontname=fontname, 
                     fontsize=mod["size"], 
                     color=(r, g, b),
-                    morph=(mod["origin"], fitz.Matrix(scale_x, 1))
+                    morph=(origin_pt, fitz.Matrix(scale_x, 1))
                 )
             except Exception as e:
-                print(f"Error inserting text: {e}")
+                print(f"Error inserting text '{mod['transformed']}': {e}")
                 # Fallback without morph if it fails
-                page.insert_text(
-                    mod["origin"], 
-                    mod["transformed"], 
-                    fontsize=mod["size"],
-                    color=(r, g, b)
-                )
+                try:
+                    page.insert_text(
+                        origin_pt, 
+                        mod["transformed"], 
+                        fontsize=mod["size"],
+                        color=(r, g, b)
+                    )
+                except:
+                    pass
 
         stats["pages_processed"] += 1
         stats["spans_modified"] += len(modifications)
@@ -587,9 +589,24 @@ def transform():
         with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp_out:
             output_path = tmp_out.name
         
-        # Transform
+        # Transform (Now using the fixed function)
         stats = transform_pdf(input_path, output_path, direction)
         
+        # Clean up input immediately
+        if input_path and os.path.exists(input_path):
+            os.unlink(input_path)
+            input_path = None
+
+        # Clean up output after request is sent
+        @after_this_request
+        def remove_file(response):
+            try:
+                if output_path and os.path.exists(output_path):
+                    os.unlink(output_path)
+            except Exception as e:
+                print(f"Error cleaning up output file: {e}")
+            return response
+
         # Send result
         return send_file(
             output_path,
@@ -599,16 +616,12 @@ def transform():
         )
         
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
-    
-    finally:
-        # Cleanup
+        # If something went wrong, clean up now
         if input_path and os.path.exists(input_path):
-            try:
-                os.unlink(input_path)
-            except:
-                pass
-        # Note: output_path cleanup happens after send_file completes
+            os.unlink(input_path)
+        if output_path and os.path.exists(output_path):
+            os.unlink(output_path)
+        return jsonify({'error': str(e)}), 500
 
 
 if __name__ == '__main__':
